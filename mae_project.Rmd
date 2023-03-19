@@ -1,0 +1,420 @@
+---
+title: "mae_demo"
+output: pdf_document
+date: '2023-02-10'
+---
+
+```{r echo=TRUE}
+library(MultiAssayExperiment)
+library(genefilter)
+library(gplots) 
+library(mogsa)
+library(tidyverse)
+library(patchwork)
+library(stats)
+library(knitr)
+
+# MOGSA Analysis
+library(mogsa)
+
+# plotting
+library(UpSetR)
+library(igraph)
+library(ggplot2)
+library(gplots)
+
+# survival analysis
+library(survival)
+library(survminer)
+library(SingleCellExperiment)
+```
+
+
+Explore two major analysis techniques, one is mogsa (multi omics data integrative clustering and gene set analysis), the other one is mofa (multi omics factor analysis)
+```{r}
+data(miniACC)
+
+data <- as.data.frame(colData(miniACC))
+
+# each row is an observation (patient)
+bio_info <- mergeReplicates(as.data.frame(wideFormat(miniACC)))
+bio_info <- drop_na(bio_info) # 43 patients remaining
+```
+
+# Check Baseline Characteristics
+```{r}
+dead <- data[data$vital_status==1, ]
+survived <- data[data$vital_status==0, ]
+
+Mean.IQR.by.trt <- function(y,trt,decp=1){
+  groups <- sort(unique(trt))
+  all <- quantile(y)
+  g1 <- quantile(y[trt==groups[1]]) # indicates hormone == 1
+  g2 <- quantile(y[trt==groups[2]]) # indicates hormone == 2
+  
+  result <- matrix(NA,1,3)
+  colnames(result) <- c(groups,"Overall")
+  # g1[2]: 25% quantile, g1[3]: median (50% quantile), g1[4]: 75% quantile
+  result[1,1] <- paste0(round(g1[3],decp)," (",round(g1[2],decp),", ",round(g1[4],decp),")")
+  result[1,2] <- paste0(round(g2[3],decp)," (",round(g2[2],decp),", ",round(g2[4],decp),")")
+  result[1,3] <- paste0(round(all[3],decp)," (",round(all[2],decp),", ",round(all[4],decp),")")
+  return(result)
+}
+
+N.prct.by.trt <- function(x,trt,decp=1){
+  groups <- sort(unique(trt))
+  x.levels <- sort(unique(x))
+  p <- length(x.levels)
+  n <- length(x)
+  n1 <- length(x[trt==groups[1]]) # total number of patients have no hormone
+  n2 <- length(x[trt==groups[2]]) # total number of patients have hormone
+  
+  result <- matrix(NA,p,3)
+  colnames(result) <- c(groups,"Overall")
+  rownames(result) <- x.levels
+  
+  for (i in 1:p){
+    # calculate the total number of patients with non-hormone on each level
+    n1i <- sum(x[trt==groups[1]]==x.levels[i])
+    # calculate the total number of patients with hormone on each level
+    n2i <- sum(x[trt==groups[2]]==x.levels[i])
+    ni <- sum(x==x.levels[i])
+    
+    
+    result[i,1] <- paste0(n1i," (",round(n1i/n1*100,decp),"%)")
+    result[i,2] <- paste0(n2i," (",round(n2i/n2*100,decp),"%)")
+    result[i,3] <- paste0(ni," (",round(ni/n*100,decp),"%)")
+  }
+  
+  
+  return(result)
+}
+
+
+table1 <- rbind(
+  Mean.IQR.by.trt(data$years_to_birth, data$vital_status), # age
+  N.prct.by.trt(data$gender, data$vital_status), #gender
+  N.prct.by.trt(data$pathologic_stage[complete.cases(data$pathologic_stage)], data$vital_status[complete.cases(data$pathologic_stage)]),
+  Mean.IQR.by.trt(data$date_of_initial_pathologic_diagnosis, data$vital_status)
+)
+
+row.names(table1)<-c('Age', 'Female', 'Male', 'Stage I', 'Stage II', 'Stage III', 'Stage IV', 'Date of Initial Pathologic Diagnosis')
+
+colnames(table1) <- c('Survived', 'Dead', 'Overall')
+
+knitr::kable(table1,caption="Adrenocortical Carcinoma Baseline Characteristics")
+```
+
+# Survival Analysis
+```{r}
+data$y <- Surv(data$days_to_death, data$vital_status)
+
+# Kaplan - Meier Curve
+KMfit <- survfit(y ~ pathologic_stage, data = data)
+ggsurvplot(
+  KMfit, 
+  cex.axis=1,
+  cex.lab=1,
+  cex.main=1, 
+  lwd=2, 
+  risk.table = F, 
+  data = data,
+  # x = 'Days to Death',
+  # title = 'Kaplan Meier Curves Based on Pathologic Stages'
+  ) +
+  labs(
+  x = 'Days to Death',
+  title = 'Kaplan Meier Curves Based on Pathologic Stages'
+  )
+
+```
+
+
+# Estimating correlation between RNA & Copy Number
+```{r}
+# For the gene with highest correlation to copy number, make a box plot of log2 expression against copy number.
+# correlation between RNASeq2GeneNorm and copy number
+subacc <- miniACC[, , c('RNASeq2GeneNorm', 'gistict')]
+
+subacc.list <- assays(subacc)
+# log transformation of the RNA-seq assay
+# +1 avoids taking log of zeroes
+subacc.list[[1]] <- log2(subacc.list[[1]] + 1)
+
+corres <- cor(subacc.list[[1]], subacc.list[[2]])
+
+hist(corres)
+cat(which.max(diag(corres)))
+# represent copy numer CHEK2
+```
+
+```{r}
+df <- wideFormat(subacc["CHEK2", , ])
+head(df)
+
+boxplot(RNASeq2GeneNorm_CHEK2 ~ gistict_CHEK2,
+        data=df, varwidth=TRUE,
+        xlab="GISTIC Relative Copy Number Call",
+        ylab="RNA-seq counts",
+        main='CHEK2')
+```
+# Prepare for Mogsa
+```{r}
+# return those biological units (here are patients) that have measurements across all experiments
+mae <- intersectColumns(miniACC[, , c('RNASeq2GeneNorm', 'gistict', 'Mutations')])
+```
+
+
+# Mogsa Analysis
+```{r}
+# Create support data
+set.seed(123)
+gene_names <- sample(rownames(mae[[1]]))
+
+# every 10 genes belong to one cluster hypothetically, the last group contains only 8 genes
+cluster.names <- c()
+for (i in 1:20) {
+  n <- paste0('gene.cluster.', i)
+  cluster.names <- append(cluster.names, n)
+}
+
+# Create clustered gene sets, a list containing 10 vectors
+gene_set <- list()
+for (i in 1:20) {
+  vec <- c()
+  if (length(gene_names) >= 10){
+    vec <- list(gene_names[1:10])
+  } else {
+    vec <- list(gene_names[1:length(gene_names)])
+  }
+  gene_names <- gene_names[11:length(gene_names)]
+  
+  gene_set <- append(gene_set, vec)
+}
+
+# main data for mogsa
+gene <- list()
+gene$rna <- assay(mae[[1]])
+gene$gistict <- assay(mae[[2]])
+gene$mutation <- assay(mae[[3]])
+
+# create a supp matrix, row is gene names, column is the gene set
+# 1 means this gene belongs to this gene set
+# Create 3 different matrix, where the number of rows of each matrix corresponds to the number of rows of each assay info in mae
+container <- list()
+
+for (i in 1:3) {
+  mat <- matrix(0, nrow=nrow(gene[[i]]), ncol=length(cluster.names))
+  colnames(mat) <- cluster.names
+  rownames(mat) <- rownames(gene[[i]])
+  for (r in 1:nrow(mat)) {
+    for (c in 1:ncol(mat)) {
+      if (rownames(mat)[r] %in% gene_set[[c]]) {
+        mat[r, c] <- 1
+      }
+    }
+  }
+  container <- append(container, list(mat))
+}
+
+supp <- list()
+supp$rna <- container[[1]]
+supp$gistict <- container[[2]]
+supp$mutation <- container[[3]]
+mgsa1 <- mogsa(x=gene, sup=supp, nf=10, proc.row = "center_ssq1", w.data = "inertia", statis = TRUE)
+```
+
+```{r}
+# The variance of each principal components (PC)
+eigs <- getmgsa(mgsa1, "partial.eig") # get partial "eigenvalue" for separate data
+barplot(as.matrix(eigs), legend.text = rownames(eigs))
+# not sure why there are 75 principal components
+```
+
+
+```{r}
+scores <- getmgsa(mgsa1, "score") # get the gene set sample pathway scores
+heatmap.2(scores, trace = "none", scale='r', Rowv=NA, Colv=T,margins=c(12,12))
+
+# find the cluster with the maxmimal score
+max.score <- names(which(rowSums(scores)==max(rowSums(scores))))
+max.score
+
+# cluster 4 has the highest gene set pathway scores
+```
+(Remember to Revise)It is also interesting to look into more detailed information for a specific gene set. For example, which dataset(s) contribute most to the high or low gene set score of a gene set?
+And which genes are most important in defining the gene set score for a gene set? The former
+question could be answered by the gene set score decomposition; the later question could
+be solve by the gene influential score. 
+```{r}
+### Part 1 Find most significant gene set(cluster) by estimating the #of significant p-values ###
+p.mat <- getmgsa(mgsa1, "p.val") # get p value matrix
+# select gene sets with most signficant GSS scores.
+# by summing up the number of each gene's p value < 0.01 across all patients
+top.gs <- sort(rowSums(p.mat < 0.01), decreasing = TRUE) # total length is 20 bc of there are only 20 clusters
+top.gs.name <- names(top.gs)
+
+# gene.cluster.16 is the most significant one
+# gene_set[[16]] "PXN"    "MAPK1"  "XBP1"   "RAB11B" "EGFR"   "PGR"    "BCL2"   "SMAD4"  "MAPK14" "TYMS"
+gs1 <- top.gs.name[1] # select the most significant gene set
+gs1
+
+
+### Part 2 Find the genes are positive correlated with gene set scores ###
+
+# gistict (copy number) & rna dataset has slightly higher influential scores
+# The expression of genes with high positive GIS more likely to have a good positive correlation with the gene set score.
+gis1 <- GIS(mgsa1, gs1)
+head(gis1) # first 6 genes highly positively correlated with gene set scores
+```
+
+
+# Multi-Omics Factor Analysis
+```{r}
+library(MOFA2)
+library(basilisk)
+
+# Use both mogsa and mofa2 to analysis mae
+mofa_obj <- create_mofa(mae)
+
+# Data Inspection
+# plot_data_overview(mofa_obj)
+print(mofa_obj) # rownames as feature (colnames are patient id's), 92 samples per group
+```
+
+```{r echo=TRUE}
+# Define Data option
+data_opts <- get_default_data_options(mofa_obj)
+# Normalization works worse when presenting heatmap though it reduces variations among factors
+data_opts$center_groups <- FALSE
+data_opts$scale_groups <- FALSE
+
+# Define Model option, dont change the default option unless familiar with the underlying mathmatical models
+model_opts <- get_default_model_options(mofa_obj)
+# head(model_opts)
+
+# Define Training option
+train_opts <- get_default_training_options(mofa_obj)
+# head(train_opts)
+
+# Prepare mofa object
+mofa_obj <- prepare_mofa(
+  object = mofa_obj,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+# training
+outfile = file.path(tempdir(),"model.hdf5")
+mofa_obj.trained <- run_mofa(mofa_obj, outfile, use_basilisk = TRUE)
+plot_variance_explained(mofa_obj.trained)
+```
+Observation, factor 1 is the most variational factor among gistict assay
+```{r}
+v <- calculate_variance_explained(mofa_obj.trained)
+v_gistict_max <- max(as.data.frame(v$r2_per_factor)[, 2])
+max.percent <- v_gistict_max/(as.data.frame(v$r2_total)[2,])
+paste0(round(max.percent * 100, 2), '%') # factor 1 accounts for 19.02 of total R^2 among all gistict factors
+```
+
+
+```{r}
+# Coefficient of Determination (R^2)
+v$r2_total
+
+# by checking the coefficient of determination, we observe that gistict dataset fit the MOFA model the best
+```
+```{r}
+# Violin plot of first three factors stratified by gender
+# thinner part represents lower probability
+
+plot_factor(mofa_obj.trained, 
+  factor = 1:3,
+  color_by = 'gender',
+  add_violin = T,
+  violin_alpha = 0.25,
+  dodge = T
+)
+```
+```{r}
+# Distribution and scatter plots of first three factors
+plot_factors(
+  mofa_obj.trained,
+  factors = 1:3,
+  color_by = 'SCNA.cluster'
+  )
+```
+From previous variance plot, we would like to investigate the factor1 in gistict, by checking the weights of each feature and their correlations.
+
+Top 5 weights
+```{r}
+plot_top_weights(mofa_obj.trained,
+  view = "gistict",
+  factor = 1,
+  nfeatures = 5
+)
+
+```
+Heatmap, we seek to present the heat map for which factor has highest R^2
+RNASeq2GeneNorm
+```{r}
+# RNASeq2GeneNorm
+v_factor <- as.data.frame(v$r2_per_factor)
+which(v_factor[, 1] == max(v_factor[, 1]))
+
+# columns are patient id
+# also report some deep orange grids
+plot_data_heatmap(mofa_obj.trained,
+  view = "RNASeq2GeneNorm",
+  factor = which(v_factor[, 1] == max(v_factor[, 1])),            
+  features = 10,          
+
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, 
+  cluster_cols = TRUE,
+  show_rownames = TRUE, 
+  show_colnames = TRUE
+)
+```
+Gistict, copy number
+```{r}
+# gistict
+v_factor <- as.data.frame(v$r2_per_factor)
+which(v_factor[, 2] == max(v_factor[, 2]))
+
+# columns are patient id
+# also report some deep orange grids
+plot_data_heatmap(mofa_obj.trained,
+  view = "gistict",
+  factor = which(v_factor[, 2] == max(v_factor[, 2])),            
+  features = 10,          
+
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, 
+  cluster_cols = TRUE,
+  show_rownames = TRUE, 
+  show_colnames = TRUE
+)
+```
+
+
+
+Same way to check the mutation, find the factor with highest R^2 first
+Mutations
+```{r}
+# Inspecting the highly correlated genes in Mutations
+which(v_factor[, 3] == max(v_factor[, 3]))
+
+plot_data_heatmap(mofa_obj.trained,
+  view = "Mutations",
+  factor = which(v_factor[, 3] == max(v_factor[, 3])),            
+  features = 10,          
+
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, 
+  cluster_cols = TRUE,
+  show_rownames = TRUE, 
+  show_colnames = TRUE
+)
+```
